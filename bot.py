@@ -50,9 +50,6 @@ LOADED = False
 STATE_MSG_ID = None
 _last_saved = None
 
-PENDING = {}       # votaciones de comodín en curso (en memoria)
-_next_vote = 1
-
 
 # ---------------------------------------------------------------------------
 # Utilidades puras
@@ -82,7 +79,8 @@ def member_name(uid: int | None):
 
 
 def add_task(desc: str):
-    t = {"id": STATE["next_id"], "desc": desc, "assignee": None, "done": False}
+    t = {"id": STATE["next_id"], "desc": desc, "assignee": None,
+         "done": False, "fixed": False}
     STATE["next_id"] += 1
     STATE["tasks"].append(t)
     return t
@@ -110,14 +108,14 @@ def delete_task_by_num(n: int) -> bool:
 
 
 def shuffle_assign():
-    """Reparte las tareas al azar y parejo entre los miembros registrados."""
+    """Reparte al azar SOLO las tareas no fijas. Las fijas (🔒) no se tocan."""
     uids = [int(u) for u in STATE["members"]]
-    if not uids or not STATE["tasks"]:
+    movibles = [t for t in STATE["tasks"] if not t.get("fixed")]
+    if not uids or not movibles:
         return
     random.shuffle(uids)
-    tasks = STATE["tasks"][:]
-    random.shuffle(tasks)
-    for i, t in enumerate(tasks):
+    random.shuffle(movibles)
+    for i, t in enumerate(movibles):
         t["assignee"] = uids[i % len(uids)]
 
 
@@ -197,13 +195,6 @@ def manual_close(now: datetime):
         report = "Esta semana ya estaba cerrada. Reinicio las tareas."
     reset_done()
     return report
-
-
-def comodin_threshold(requester: int):
-    otros = [uid for uid in STATE["members"] if int(uid) != requester]
-    eligible = len(otros)
-    need = eligible // 2 + 1 if eligible else 0
-    return need, eligible
 
 
 def pending_by_member():
@@ -314,7 +305,8 @@ def build_tasks_view():
     for i, t in enumerate(STATE["tasks"], start=1):
         name = member_name(t["assignee"]) or "sin asignar"
         emoji = "🟢" if t["done"] else "⬜"
-        lines.append(f"{i}. {emoji} {t['desc']} — {name}")
+        lock = "🔒 " if t.get("fixed") else ""
+        lines.append(f"{i}. {emoji} {lock}{t['desc']} — {name}")
         row.append(InlineKeyboardButton(f"{emoji} {i}", callback_data=f"toggle:{t['id']}"))
         if len(row) == 3:
             buttons.append(row); row = []
@@ -329,12 +321,17 @@ def build_manage_view():
     buttons = []
     for i, t in enumerate(STATE["tasks"], start=1):
         name = member_name(t["assignee"]) or "sin asignar"
-        lines.append(f"{i}. {t['desc']} — {name}")
+        lock = "🔒 " if t.get("fixed") else ""
+        lines.append(f"{i}. {lock}{t['desc']} — {name}")
+        lock_btn = "🔓" if t.get("fixed") else "🔒"
         buttons.append([
             InlineKeyboardButton(f"🗑️ {i}", callback_data=f"del:{t['id']}"),
             InlineKeyboardButton(f"🔄 {i}", callback_data=f"rea:{t['id']}"),
+            InlineKeyboardButton(f"{lock_btn} {i}", callback_data=f"fix:{t['id']}"),
         ])
-    lines.append("\n🗑️ eliminar · 🔄 reasignar\nRenombrar: /renombrar <n> <texto>")
+    lines.append("\n🗑️ eliminar · 🔄 reasignar · 🔒 fijar/soltar"
+                 "\n(las 🔒 fijas no se mueven con /repartir ni /auto)"
+                 "\nRenombrar: /renombrar <n> <texto>")
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
@@ -350,7 +347,6 @@ AYUDA = (
     "• /tareas — ver y marcar tareas con botones\n"
     "• /gestionar — eliminar o reasignar tareas\n"
     "• /renombrar <n> <texto> — cambiar el nombre de la tarea n\n"
-    "• /comodin [motivo] — pedir que te perdonen una tarea (se vota)\n"
     "• /tarro — cuánto debe cada quien\n"
     "• /saldar — marcar que alguien ya pagó\n"
     "• /cerrar — cerrar la semana ahora\n\n"
@@ -486,20 +482,6 @@ async def cmd_cerrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report, parse_mode="Markdown")
 
 
-async def cmd_comodin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await pre(update, context)
-    u = update.effective_user
-    if str(u.id) not in STATE["members"]:
-        await update.message.reply_text("Primero usa /registrarme."); return
-    mine = [t for t in STATE["tasks"] if t["assignee"] == u.id and not t["done"]]
-    if not mine:
-        await update.message.reply_text("No tienes tareas pendientes para pedir comodín."); return
-    context.user_data["comodin_note"] = " ".join(context.args).strip()
-    botones = [[InlineKeyboardButton(t["desc"], callback_data=f"joker:{t['id']}")] for t in mine]
-    await update.message.reply_text("🃏 ¿Para cuál tarea pides comodín?",
-                                    reply_markup=InlineKeyboardMarkup(botones))
-
-
 # ---------------------------------------------------------------------------
 # Botones
 # ---------------------------------------------------------------------------
@@ -567,6 +549,18 @@ async def cb_rea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               reply_markup=InlineKeyboardMarkup(botones))
 
 
+async def cb_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    t = get_task(int(q.data.split(":")[1]))
+    if not t:
+        await q.answer("Ya no existe.", show_alert=True); return
+    t["fixed"] = not t.get("fixed", False)
+    await save_state(context)
+    await q.answer("Fijada 🔒 (no se moverá)" if t["fixed"] else "Soltada 🔓 (ya rota)")
+    text, markup = build_manage_view()
+    await q.edit_message_text(text, reply_markup=markup)
+
+
 async def cb_saldar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.data.split(":")[1]
@@ -579,78 +573,6 @@ async def cb_saldar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer("Saldado ✅")
     await q.edit_message_text(
         f"🧾 {m['name']} pagó {cop(pagado)}. Queda al día (saldo $0).")
-
-
-# ----- Comodín (votación) --------------------------------------------------
-def _vote_text(v):
-    need, eligible = comodin_threshold(v["requester"])
-    nombre = member_name(v["requester"]) or "Alguien"
-    t = get_task(v["task_id"])
-    desc = t["desc"] if t else "(tarea)"
-    lines = [f"🃏 *{nombre}* pide comodín para: *{desc}*"]
-    if v["note"]:
-        lines.append(f"_Motivo:_ {v['note']}")
-    lines.append(f"\nNecesita {need} voto(s) a favor de {eligible} persona(s).")
-    lines.append(f"👍 {len(v['yes'])}   👎 {len(v['no'])}")
-    return "\n".join(lines)
-
-
-async def cb_joker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _next_vote
-    q = update.callback_query
-    tid = int(q.data.split(":")[1])
-    t = get_task(tid)
-    if not t or t["assignee"] != q.from_user.id:
-        await q.answer("No puedes pedir comodín de esa tarea.", show_alert=True); return
-    need, eligible = comodin_threshold(q.from_user.id)
-    if eligible == 0:
-        await q.answer("No hay nadie más para votar.", show_alert=True); return
-    vid = _next_vote; _next_vote += 1
-    v = {"task_id": tid, "requester": q.from_user.id,
-         "note": context.user_data.get("comodin_note", ""), "yes": set(), "no": set()}
-    PENDING[vid] = v
-    await q.answer()
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 Aprobar", callback_data=f"vote:yes:{vid}"),
-        InlineKeyboardButton("👎 Rechazar", callback_data=f"vote:no:{vid}"),
-    ]])
-    await q.edit_message_text(_vote_text(v), parse_mode="Markdown", reply_markup=kb)
-
-
-async def cb_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    _, choice, vid = q.data.split(":")
-    vid = int(vid)
-    v = PENDING.get(vid)
-    if not v:
-        await q.answer("Esta votación ya terminó.", show_alert=True); return
-    voter = q.from_user.id
-    if voter == v["requester"]:
-        await q.answer("No puedes votar tu propio comodín 🙂", show_alert=True); return
-    if str(voter) not in STATE["members"]:
-        await q.answer("Debes usar /registrarme para votar.", show_alert=True); return
-    v["yes"].discard(voter); v["no"].discard(voter)
-    (v["yes"] if choice == "yes" else v["no"]).add(voter)
-
-    need, _ = comodin_threshold(v["requester"])
-    t = get_task(v["task_id"])
-    if len(v["yes"]) >= need:
-        PENDING.pop(vid, None)
-        if t:
-            t["done"] = True
-            await save_state(context)
-        await q.answer("Aprobado")
-        await q.edit_message_text(
-            f"✅ Comodín APROBADO para “{t['desc'] if t else ''}”. Cuenta como hecha esta semana.")
-        return
-    if len(v["no"]) >= need:
-        PENDING.pop(vid, None)
-        await q.answer("Rechazado")
-        await q.edit_message_text(
-            f"❌ Comodín RECHAZADO para “{t['desc'] if t else ''}”. Sigue pendiente.")
-        return
-    await q.answer("Voto registrado")
-    await q.edit_message_text(_vote_text(v), parse_mode="Markdown", reply_markup=q.message.reply_markup)
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +589,7 @@ async def _send_reminder(bot, chat_id):
         mention = f'<a href="tg://user?id={uid}">{html.escape(name)}</a>'
         tareas = ", ".join(html.escape(d) for d in descs)
         parts.append(f"{mention}: {tareas}")
-    parts.append("\nMárcalas en /tareas ✅  ·  ¿hiciste otra cosa? pide /comodin 🃏")
+    parts.append("\nMárcalas en /tareas ✅")
     await bot.send_message(chat_id, "\n".join(parts), parse_mode="HTML")
     return True
 
@@ -720,7 +642,6 @@ def main():
     app.add_handler(CommandHandler("tareas", cmd_tareas))
     app.add_handler(CommandHandler("gestionar", cmd_gestionar))
     app.add_handler(CommandHandler("renombrar", cmd_renombrar))
-    app.add_handler(CommandHandler("comodin", cmd_comodin))
     app.add_handler(CommandHandler("tarro", cmd_tarro))
     app.add_handler(CommandHandler("saldar", cmd_saldar))
     app.add_handler(CommandHandler(["cerrar", "cerrar_semana"], cmd_cerrar))
@@ -730,8 +651,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_del, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(cb_rea, pattern=r"^rea:"))
     app.add_handler(CallbackQueryHandler(cb_saldar, pattern=r"^saldar:"))
-    app.add_handler(CallbackQueryHandler(cb_joker, pattern=r"^joker:"))
-    app.add_handler(CallbackQueryHandler(cb_vote, pattern=r"^vote:"))
+    app.add_handler(CallbackQueryHandler(cb_fix, pattern=r"^fix:"))
 
     app.job_queue.run_daily(
         remind_job, time=time(REMIND_HOUR, 0, tzinfo=TZ), name="recordatorio")
