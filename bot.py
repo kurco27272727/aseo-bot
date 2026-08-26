@@ -661,10 +661,10 @@ def main():
     if port and base:
         log.info("Modo webhook: %s", base)
         app.run_webhook(listen="0.0.0.0", port=port, url_path=token,
-                        webhook_url=f"{base}/{token}", drop_pending_updates=True)
+                        webhook_url=f"{base}/{token}", drop_pending_updates=False)
     else:
         log.info("Modo polling (local)")
-        app.run_polling(drop_pending_updates=True)
+        app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
