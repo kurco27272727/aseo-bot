@@ -80,10 +80,15 @@ def member_name(uid: int | None):
 
 def add_task(desc: str):
     t = {"id": STATE["next_id"], "desc": desc, "assignee": None,
-         "done": False, "fixed": False}
+         "done": False, "fixed": False, "rol": None, "skip_week": False}
     STATE["next_id"] += 1
     STATE["tasks"].append(t)
     return t
+
+
+def active_tasks():
+    """Tareas activas esta semana (excluye las lozas que un baño reemplazó)."""
+    return [t for t in STATE["tasks"] if not t.get("skip_week")]
 
 
 def get_task(tid: int):
@@ -94,8 +99,9 @@ def get_task(tid: int):
 
 
 def task_by_num(n: int):
-    if 1 <= n <= len(STATE["tasks"]):
-        return STATE["tasks"][n - 1]
+    act = active_tasks()
+    if 1 <= n <= len(act):
+        return act[n - 1]
     return None
 
 
@@ -108,20 +114,43 @@ def delete_task_by_num(n: int) -> bool:
 
 
 def shuffle_assign():
-    """Reparte al azar SOLO las tareas no fijas. Las fijas (🔒) no se tocan."""
+    """Reparte al azar. Reglas:
+    - Las fijas (🔒) no se mueven.
+    - Las rotativas (Baño, Cocina, Patio…) se reparten parejo.
+    - El baño 'reemplaza-loza' (🚽↔) cae en alguien que NO tenga el baño
+      rotativo (🚽), y le quita una loza esa semana (no es tarea extra)."""
     uids = [int(u) for u in STATE["members"]]
-    movibles = [t for t in STATE["tasks"] if not t.get("fixed")]
-    if not uids or not movibles:
+    if not uids:
         return
+    # 1) limpiar los reemplazos de la semana anterior
+    for t in STATE["tasks"]:
+        t["skip_week"] = False
+    # 2) repartir las rotativas normales (no fijas y no el baño reemplaza-loza)
+    movibles = [t for t in STATE["tasks"]
+                if not t.get("fixed") and t.get("rol") != "bano_loza"]
     random.shuffle(uids)
     random.shuffle(movibles)
     for i, t in enumerate(movibles):
         t["assignee"] = uids[i % len(uids)]
+    # 3) el baño que reemplaza loza
+    reempl = next((t for t in STATE["tasks"] if t.get("rol") == "bano_loza"), None)
+    if reempl:
+        bano_rot = next((t for t in movibles if t.get("rol") == "bano"), None)
+        excluir = bano_rot["assignee"] if bano_rot else None
+        candidatos = [u for u in uids if u != excluir] or uids[:]
+        elegido = random.choice(candidatos)
+        reempl["assignee"] = elegido
+        reempl["done"] = False
+        # quitarle una loza fija (reemplazada por el baño)
+        lozas = [t for t in STATE["tasks"]
+                 if t.get("fixed") and t["assignee"] == elegido]
+        if lozas:
+            random.choice(lozas)["skip_week"] = True
 
 
 def do_charge():
     fallidas = []
-    for t in STATE["tasks"]:
+    for t in active_tasks():
         if not t["done"]:
             fallidas.append((t["desc"], member_name(t["assignee"])))
             if t["assignee"] is not None:
@@ -138,7 +167,7 @@ def reset_done():
 
 def _charge_report(fallidas, titulo) -> str:
     out = [f"📅 *{titulo}*\n"]
-    hechas = sum(1 for t in STATE["tasks"] if t["done"])
+    hechas = sum(1 for t in active_tasks() if t["done"])
     out.append(f"✅ Cumplidas esta semana: {hechas}")
     if fallidas:
         out.append(f"\n🔴 No cumplidas (+{cop(MULTA)} c/u):")
@@ -157,7 +186,7 @@ def _charge_report(fallidas, titulo) -> str:
 
 def _assign_summary(titulo) -> str:
     lines = [f"🎲 *{titulo}:*"]
-    for t in STATE["tasks"]:
+    for t in active_tasks():
         lines.append(f"   • {t['desc']} → {member_name(t['assignee']) or 'sin asignar'}")
     return "\n".join(lines)
 
@@ -199,7 +228,7 @@ def manual_close(now: datetime):
 
 def pending_by_member():
     pend = {}
-    for t in STATE["tasks"]:
+    for t in active_tasks():
         if not t["done"] and t["assignee"] is not None:
             pend.setdefault(t["assignee"], []).append(t["desc"])
     return pend
@@ -297,16 +326,26 @@ async def pre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Vistas
 # ---------------------------------------------------------------------------
+def _rol_icon(t):
+    r = t.get("rol")
+    if r == "bano":
+        return "🚽 "
+    if r == "bano_loza":
+        return "🚽↔ "
+    return ""
+
+
 def build_tasks_view():
-    if not STATE["tasks"]:
+    act = active_tasks()
+    if not act:
         return ("🧹 No hay tareas.\nAgrega una con:  /nueva lavar la loza"), None
     lines = ["🧹 Tareas de la semana:\n"]
     row, buttons = [], []
-    for i, t in enumerate(STATE["tasks"], start=1):
+    for i, t in enumerate(act, start=1):
         name = member_name(t["assignee"]) or "sin asignar"
         emoji = "🟢" if t["done"] else "⬜"
         lock = "🔒 " if t.get("fixed") else ""
-        lines.append(f"{i}. {emoji} {lock}{t['desc']} — {name}")
+        lines.append(f"{i}. {emoji} {lock}{_rol_icon(t)}{t['desc']} — {name}")
         row.append(InlineKeyboardButton(f"{emoji} {i}", callback_data=f"toggle:{t['id']}"))
         if len(row) == 3:
             buttons.append(row); row = []
@@ -317,20 +356,22 @@ def build_tasks_view():
 
 
 def build_manage_view():
+    act = active_tasks()
     lines = ["🔧 Gestionar tareas:\n"]
     buttons = []
-    for i, t in enumerate(STATE["tasks"], start=1):
+    for i, t in enumerate(act, start=1):
         name = member_name(t["assignee"]) or "sin asignar"
         lock = "🔒 " if t.get("fixed") else ""
-        lines.append(f"{i}. {lock}{t['desc']} — {name}")
+        lines.append(f"{i}. {lock}{_rol_icon(t)}{t['desc']} — {name}")
         lock_btn = "🔓" if t.get("fixed") else "🔒"
         buttons.append([
             InlineKeyboardButton(f"🗑️ {i}", callback_data=f"del:{t['id']}"),
             InlineKeyboardButton(f"🔄 {i}", callback_data=f"rea:{t['id']}"),
             InlineKeyboardButton(f"{lock_btn} {i}", callback_data=f"fix:{t['id']}"),
+            InlineKeyboardButton(f"🚽 {i}", callback_data=f"rol:{t['id']}"),
         ])
-    lines.append("\n🗑️ eliminar · 🔄 reasignar · 🔒 fijar/soltar"
-                 "\n(las 🔒 fijas no se mueven con /repartir ni /auto)"
+    lines.append("\n🗑️ eliminar · 🔄 reasignar · 🔒 fijar · 🚽 tipo baño"
+                 "\n🚽 cambia entre: normal → baño rotativo → baño que quita loza → normal"
                  "\nRenombrar: /renombrar <n> <texto>")
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -561,6 +602,23 @@ async def cb_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, reply_markup=markup)
 
 
+async def cb_rol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    t = get_task(int(q.data.split(":")[1]))
+    if not t:
+        await q.answer("Ya no existe.", show_alert=True); return
+    # cicla: normal -> baño rotativo -> baño que quita loza -> normal
+    nxt = {None: "bano", "bano": "bano_loza", "bano_loza": None}
+    t["rol"] = nxt.get(t.get("rol"))
+    await save_state(context)
+    aviso = {"bano": "🚽 Baño rotativo",
+             "bano_loza": "🚽↔ Baño que quita una loza",
+             None: "Normal (ya no es baño)"}[t["rol"]]
+    await q.answer(aviso)
+    text, markup = build_manage_view()
+    await q.edit_message_text(text, reply_markup=markup)
+
+
 async def cb_saldar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.data.split(":")[1]
@@ -652,6 +710,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_rea, pattern=r"^rea:"))
     app.add_handler(CallbackQueryHandler(cb_saldar, pattern=r"^saldar:"))
     app.add_handler(CallbackQueryHandler(cb_fix, pattern=r"^fix:"))
+    app.add_handler(CallbackQueryHandler(cb_rol, pattern=r"^rol:"))
 
     app.job_queue.run_daily(
         remind_job, time=time(REMIND_HOUR, 0, tzinfo=TZ), name="recordatorio")
